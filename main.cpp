@@ -2,6 +2,7 @@
 #include <chrono>
 #include <new>
 #include <vector>
+#include <cassert>
 
 struct Order {
     uint64_t order_id;      // 8 bytes — unique ID
@@ -12,39 +13,80 @@ struct Order {
     uint8_t  side;          // 1 byte — BID or ASK
     uint8_t  type;          // 1 byte — LIMIT, MARKET
     uint8_t  status;        // 1 byte — ACTIVE, CANCELLED, FILLED
-    uint8_t  padding[5];    // 5 bytes — pad to 48 bytes total
+    uint8_t  _pad[5];    // 5 bytes — pad to 48 bytes total
+};
+static_assert(sizeof(Order) == 40, "Order size mismatch — recheck padding");
+
+// structure splitting
+struct OrderHot {
+    // OrderHot which will be called and used most often
+    uint64_t price;
+    uint32_t remaining_qty;
+    uint8_t  side;
+    uint8_t  _pad[3];
+};
+static_assert(sizeof(OrderHot) == 16, "OrderHot size mismatch");
+
+struct OrderCold {
+    // less used data
+    uint64_t order_id;
+    uint64_t timestamp;
+    uint32_t quantity;
+    uint8_t  type;
+    uint8_t  status;
+    uint8_t  _pad[2];
+};
+static_assert(sizeof(OrderCold) == 24, "OrderCold size mismatch");
+
+// we need something to handle these orders, making sure they are properly being accessed, we will use index based accessing
+struct OrderHandler {
+    uint32_t index;
+    static constexpr u_int32_t INVALID = UINT32_MAX; // making sure the index doesn't reach its max range value, even if it does, we don't process anything
+    [[nodiscard]]
+    bool valid() const noexcept { return index != INVALID; }
 };
 
-static_assert(sizeof(Order) == 40, "Order size mismatch — recheck padding");
+// The big guy
 class PoolAllocator {
 private:
-    char *data_ = nullptr;
-    size_t capacity_ = 0;
-    size_t offset_ = 0;
+    OrderHot* hot_ = nullptr;
+    OrderCold* cold_ = nullptr;
+    uint32_t capacity_ = 0;
+    uint32_t size_ = 0;
 public:
-    explicit PoolAllocator(const size_t n_orders = 1024 * 1024) {
-        capacity_ = sizeof(Order) * n_orders;
+    explicit PoolAllocator(const size_t n_orders = 1024 * 1024) :capacity_(n_orders) {
         // 64-byte aligned so the first slot lands on a cache-line boundary.
-        data_ = static_cast<char*>(::operator new[](capacity_, std::align_val_t{64}));
+        hot_ = static_cast<OrderHot*>(::operator new[](sizeof(OrderHot) * n_orders, std::align_val_t{64}));
+        cold_ = static_cast<OrderCold*>(::operator new[](sizeof(OrderCold) * n_orders, std::align_val_t{64}));
     }
     [[nodiscard]]
-    inline Order* allocate(const Order& order) noexcept {
-        if (offset_ + sizeof(Order) > capacity_) return nullptr;
-        auto* ptr = new (data_ + offset_) Order(order);
-        offset_ += sizeof(Order);
-        return ptr;
+    inline OrderHandler allocate(const OrderHot hot, const OrderCold& cold) noexcept {
+        if (size_ >= capacity_) return {OrderHandler::INVALID};
+        const auto idx = size_++;
+        new(hot_+idx) OrderHot{hot};
+        new(cold_+idx) OrderCold{cold};
+        return {idx};
     }
-    inline void reset() noexcept { offset_ = 0; }
+    // just the hot order details
     [[nodiscard]]
-    inline size_t size() const noexcept{
-        return offset_;
+    inline OrderHot* getHot(const OrderHandler h) const noexcept {
+        assert(h.valid() && h.index < size_);
+        return (hot_ + h.index);
     }
+    // to just access the cold details
     [[nodiscard]]
-    inline size_t capacity() const noexcept {
-        return capacity_;
+    inline OrderCold* getCold(const OrderHandler h) const noexcept {
+        assert(h.valid() && h.index < size_);
+        return (cold_ + h.index);
     }
+    inline void reset() noexcept { size_ = 0; }
+    [[nodiscard]]
+    inline size_t size() const noexcept{ return size_; }
+    [[nodiscard]]
+    inline size_t capacity() const noexcept { return capacity_; }
     ~PoolAllocator() {
-        ::operator delete[](data_, std::align_val_t{64});
+        ::operator delete[](hot_, std::align_val_t{64});
+        ::operator delete[](cold_, std::align_val_t{64});
     }
     // remove the move and copy operator
     PoolAllocator(const PoolAllocator&)            = delete;
@@ -53,23 +95,54 @@ public:
 static volatile uint64_t sink;
 [[gnu::noinline]]
 static void do_not_optimize(const uint64_t v) { sink = v; }
+// [[gnu::noinline]] is to make sure the compiler doesn't inline this, whatever optimization flag you use
 
 int main() {
     constexpr uint64_t N = 1'000'000;
     // we will use do_not_optimize and checksum to make sure the compiler doesn't optimize away the whole code
     {
         PoolAllocator pool(N);
-        uint64_t checksum = 0;
+        std::vector<OrderHandler> handles;
+        handles.reserve(N); // so that we don't call shitty allocator for this all the time now
         const auto t0 = std::chrono::high_resolution_clock::now();
-        for (uint64_t i = 0; i < N; ++i) {
-            const Order* o = pool.allocate({i, 1000, 102 + i, 45, 45, 1, 1, 1});
-            checksum += o->order_id;
+        for (uint32_t i = 0; i < N; ++i) {
+            handles.emplace_back(pool.allocate(
+                OrderHot  {102 + i, 45, 1, {}},
+                OrderCold {i, 1000, 45, 1, 0, {}}
+            ));
         }
         const auto t1 = std::chrono::high_resolution_clock::now();
+        std::cout << "Allocation of " << N << " orders: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+              << "µs\n";
+        // now only hot access
+        uint64_t checksum = 0;
+        const auto t2 = std::chrono::high_resolution_clock::now();
+        for (uint32_t i = 0; i < N; ++i) {
+            checksum += pool.getHot(handles[i])->price;
+        }
+        const auto t3 = std::chrono::high_resolution_clock::now();
         do_not_optimize(checksum);
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-        std::cout << "Pool allocator: " << ms << " ms  (" << us << " µs)\n";
+        std::cout << "Hot-only scan: "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count()
+                  << "µs\n";
+        // now only cold access
+        const auto t4 = std::chrono::high_resolution_clock::now();
+        for (uint32_t i = 0; i < N; ++i) {
+            checksum += pool.getCold(handles[i])->order_id;
+        }
+        const auto t5 = std::chrono::high_resolution_clock::now();
+        do_not_optimize(checksum);
+        std::cout << "Cold scan: "
+                << std::chrono::duration_cast<std::chrono::microseconds>(t5 - t4).count()
+                <<"μs\n";
+        // Some math to understand how much is what
+        std::cout << "\nWorking set(hot " << N << " orders): "
+          << (sizeof(OrderHot) * N) / 1024 << "KB\n";
+        std::cout << "Working set(cold " << N << " orders): "
+                  << (sizeof(OrderCold) * N) / 1024 << "KB\n";
+        std::cout << "Hot orders per cache line: "
+                  << 64 / sizeof(OrderHot) << "\n\n";
     }
     {
         std::vector<Order*> ptrs;
@@ -77,15 +150,32 @@ int main() {
         uint64_t checksum = 0;
         const auto t0 = std::chrono::high_resolution_clock::now();
         for (uint64_t i = 0; i < N; ++i) {
-            ptrs.push_back(new Order{i, 1000, 102 + i, 45, 45, 1, 1, 1});
+            ptrs.push_back(new Order{i, 1000, 102 + i, 45, 45, 1, 1, 1, {}});
             checksum += ptrs.back()->order_id;
         }
         for (const Order* p : ptrs) delete p;
         const auto t1 = std::chrono::high_resolution_clock::now();
         do_not_optimize(checksum);
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-        std::cout << "new / delete:" << ms << " ms  (" << us << " µs)\n";
+        std::cout << "new/delete: " <<
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+            <<"µs\n";
+        // Now access time for regular order with regular method
+        std::vector<Order*> ptrs2;
+        ptrs2.reserve(N);
+        for (uint64_t i = 0; i < N; ++i) {
+            ptrs2.push_back(new Order{i, 1000, 102 + i, 45, 45, 1, 1, 1, {}});
+        }
+        const auto t2 = std::chrono::high_resolution_clock::now();
+        checksum = 0;
+        for (uint64_t i = 0; i < N; ++i) {
+            checksum += ptrs[i]->order_id;
+        }
+        const auto t3 = std::chrono::high_resolution_clock::now();
+        do_not_optimize(checksum);
+        std::cout << "Order access time: "
+        << std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count()
+        <<"µs\n";
+        for (const Order* p : ptrs2) delete p;
     }
     return 0;
 }
