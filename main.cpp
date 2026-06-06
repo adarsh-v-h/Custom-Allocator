@@ -3,6 +3,9 @@
 #include <new>
 #include <vector>
 #include <cassert>
+#include <cstring>
+#include <span>
+#include <immintrin.h> // for SIMD ops
 
 struct Order {
     uint64_t order_id;      // 8 bytes — unique ID
@@ -34,9 +37,9 @@ struct OrderCold {
     uint32_t quantity;
     uint8_t  type;
     uint8_t  status;
-    uint8_t  _pad[2];
+    uint8_t  _pad[10];
 };
-static_assert(sizeof(OrderCold) == 24, "OrderCold size mismatch");
+static_assert(sizeof(OrderCold) == 32, "OrderCold size mismatch");
 
 // we need something to handle these orders, making sure they are properly being accessed, we will use index based accessing
 struct OrderHandler {
@@ -53,11 +56,38 @@ private:
     OrderCold* cold_ = nullptr;
     uint32_t capacity_ = 0;
     uint32_t size_ = 0;
+    // this is a function which sets the whole allocated memory to 0, instead of just leaving it with garbage value
+    // we will use intrinsic intel SIMD functions to get it done it in the most efficient way
+    static void simdZero(void* ptr,const size_t n_bytes) noexcept {
+        assert(n_bytes%32==0);
+        __m256i* dst = static_cast<__m256i*>(ptr); // to cast the void pointer to a pointer that will target AVX register??
+        const __m256i zero = _mm256_setzero_si256(); // setting a 32 byte register to 0, which we will use to set other values as 0
+        const size_t n = n_bytes/32; // no of interactions
+        for (size_t i = 0; i < n; ++i) {
+            _mm256_store_si256(dst+i, zero); // aligned store, i.e 32 bytes
+        }
+    }
+    // this function also uses SIMD, but it is to copy from 1 source to another
+    static void simdCopy(void* dst, const void* src,const size_t n_bytes) noexcept {
+        assert(n_bytes%32==0);
+        auto* d = static_cast<__m256i*>(dst);
+        const auto* s = static_cast<const __m256i*>(src);
+        const size_t n = n_bytes/32;
+        for (size_t i = 0; i < n; ++i) {
+            _mm256_store_si256(d+i, _mm256_load_si256(s+i));
+        }
+    }
 public:
     explicit PoolAllocator(const size_t n_orders = 1024 * 1024) :capacity_(n_orders) {
         // 64-byte aligned so the first slot lands on a cache-line boundary.
         hot_ = static_cast<OrderHot*>(::operator new[](sizeof(OrderHot) * n_orders, std::align_val_t{64}));
         cold_ = static_cast<OrderCold*>(::operator new[](sizeof(OrderCold) * n_orders, std::align_val_t{64}));
+        // now we will zero out both pools
+        // but for it work, the data must be a divible of 32, for strutCold its not an issue, since its size itself is 32
+        // for OrderHot which is of 16 bytes, the number of orders must be even for this to work
+        assert(sizeof(n_order & 0b1)==0); // we will just check if the last bit of the value is 0, if so its even, so OrderHot will be fine
+        simdZero(hot_,n_orders*sizeof(OrderHot));
+        simdZero(cold_,n_orders*sizeof(OrderCold));
     }
     [[nodiscard]]
     inline OrderHandler allocate(const OrderHot hot, const OrderCold& cold) noexcept {
@@ -67,6 +97,8 @@ public:
         new(cold_+idx) OrderCold{cold};
         return {idx};
     }
+    
+
     // just the hot order details
     [[nodiscard]]
     inline OrderHot* getHot(const OrderHandler h) const noexcept {
