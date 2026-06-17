@@ -1,0 +1,4 @@
+Metric	PoolAllocator	StandardNew
+Allocation	11200	30123
+HotScan	1202	2254
+ColdScan	1683	0

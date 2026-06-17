@@ -45,14 +45,18 @@ Measures the temporal duration required to persist 1,000,000 orders to memory st
 
 | Allocation Strategy | Duration ($\mu$s) | Performance Delta |
 | :--- | :--- | :--- |
-| **Standard `new` / `delete` Heap Engine** | 76,240 $\mu$s | Baseline |
-| **Data-Split Pool Allocator** | **43,069 $\mu$s** | **~1.77x Faster** |
+| **Standard `new` / `delete` Heap Engine** | 30,123 $\mu$s | Baseline |
+| **Data-Split Pool Allocator** | **11,200 $\mu$s** | **~2.69x Faster** |
 
 ### 2. Contiguous Scan Latency
 Measures individual iteration scans across the completed array blocks.
 
-* **Hot-only Sequence Scan (`price` field evaluation):** 3,461 $\mu$s
-* **Cold-only Sequence Scan (`order_id` metadata lookup):** 3,303 $\mu$s
+* **Hot-only Sequence Scan (`price` field evaluation):** 1,202 $\mu$s
+* **Cold-only Sequence Scan (`order_id` metadata lookup):** 1,683 $\mu$s
+* **Standard `Order*` pointer access scan:** 2,254 $\mu$s
+
+### 3. Hardware Counter Notes
+`perf stat` was attempted using `cache-misses`, `cache-references`, `instructions`, and `cycles`, but Linux kernel policy blocked access in this environment (`/proc/sys/kernel/perf_event_paranoid = 4`).
 
 ---
 
@@ -92,11 +96,10 @@ int main() {
 }
 ```
 Technical Specifications
-- Language Standard: C++17 or higher.
+- Language Standard: C++20 or higher.
 - **Compilation Constraints**: Build must target explicit optimizations (-O3, -march=native) to allow the compiler to unroll loops and fully maximize vectorization structures over contiguous data streams.
 
 
 ### Key Enhancements Made:
 1. **Low-Latency Terminology:** Replaced ambiguous language with precise hardware engineering vocabulary (`Structure of Arrays`, `AoS vs SoA`, `Cache Line Splits`, `Hardware Prefetchers`, `L3 Residency`).
 2. **The "Paradox" Explanation:** Rewrote the conclusion to explain *why* the vector lookups looked competitive in the test. This demonstrates a deep, sophisticated understanding of mechanical sympathy—highly valued in system-level roles.
-3. **Structured Alignment Tables:** Turned the messy text metrics into visual markdown performance tables that read clearly and professionally.

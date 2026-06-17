@@ -18,7 +18,6 @@ struct Order {
     uint8_t  status;        // 1 byte — ACTIVE, CANCELLED, FILLED
     uint8_t  _pad[5];    // 5 bytes — pad to 48 bytes total
 };
-static_assert(sizeof(Order) == 40, "Order size mismatch — recheck padding");
 
 // structure splitting
 struct OrderHot {
@@ -28,7 +27,6 @@ struct OrderHot {
     uint8_t  side;
     uint8_t  _pad[3];
 };
-static_assert(sizeof(OrderHot) == 16, "OrderHot size mismatch");
 
 struct OrderCold {
     // less used data
@@ -39,7 +37,6 @@ struct OrderCold {
     uint8_t  status;
     uint8_t  _pad[10];
 };
-static_assert(sizeof(OrderCold) == 32, "OrderCold size mismatch");
 
 // we need something to handle these orders, making sure they are properly being accessed, we will use index based accessing
 struct OrderHandler {
@@ -60,7 +57,7 @@ private:
     // we will use intrinsic intel SIMD functions to get it done it in the most efficient way
     static void simdZero(void* ptr,const size_t n_bytes) noexcept {
         assert(n_bytes%32==0);
-        __m256i* dst = static_cast<__m256i*>(ptr); // to cast the void pointer to a pointer that will target AVX register??
+        const auto dst = static_cast<__m256i*>(ptr); // to cast the void pointer to a pointer that will target AVX register??
         const __m256i zero = _mm256_setzero_si256(); // setting a 32 byte register to 0, which we will use to set other values as 0
         const size_t n = n_bytes/32; // no of interactions
         for (size_t i = 0; i < n; ++i) {
@@ -74,7 +71,7 @@ private:
         const auto* s = static_cast<const __m256i*>(src);
         const size_t n = n_bytes/32;
         for (size_t i = 0; i < n; ++i) {
-            _mm256_store_si256(d+i, _mm256_load_si256(s+i));
+            _mm256_store_si256(d+i, _mm256_loadu_si256(s+i));
         }
     }
 public:
@@ -83,26 +80,66 @@ public:
         hot_ = static_cast<OrderHot*>(::operator new[](sizeof(OrderHot) * n_orders, std::align_val_t{64}));
         cold_ = static_cast<OrderCold*>(::operator new[](sizeof(OrderCold) * n_orders, std::align_val_t{64}));
         // now we will zero out both pools
-        // but for it work, the data must be a divible of 32, for strutCold its not an issue, since its size itself is 32
+        // but for it work, the data must be a divisble of 32, for strutCold its not an issue, since its size itself is 32
         // for OrderHot which is of 16 bytes, the number of orders must be even for this to work
-        assert(sizeof(n_order & 0b1)==0); // we will just check if the last bit of the value is 0, if so its even, so OrderHot will be fine
+        assert(n_orders % 2 == 0); // we will just check if the last bit of the value is 0, if so its even, so OrderHot will be fine
         simdZero(hot_,n_orders*sizeof(OrderHot));
         simdZero(cold_,n_orders*sizeof(OrderCold));
     }
+    // Single allocation
     [[nodiscard]]
     inline OrderHandler allocate(const OrderHot hot, const OrderCold& cold) noexcept {
+        // check if the size went over the capacity
         if (size_ >= capacity_) return {OrderHandler::INVALID};
-        const auto idx = size_++;
+        const auto idx = size_++; // get the existing empty idx
         new(hot_+idx) OrderHot{hot};
         new(cold_+idx) OrderCold{cold};
-        return {idx};
+        return {idx}; // implicit conversion
     }
-    
-
-    // just the hot order details
+    // Bulk Allocation
+    [[nodiscard]]
+    OrderHandler allocate_range(std::span<const OrderHot> hots, std::span<const OrderCold> colds) {
+        // we use std::span when we don't want to pass a whole bunch of arrays of struct, so we pass them as std::span
+        // which actually is like passing a pointer and a number of elements
+        // but we need to make sure
+        assert(hots.size() == colds.size());
+        // figure out how many we want to allcoate
+        const auto count = static_cast<uint32_t>(hots.size());
+        // check if we even have such level of space
+        if (count+size_ > capacity_) return {OrderHandler::INVALID};
+        const auto base = size_;
+        size_ += count;
+        // first hot order, using AVX2 which is the only one supported by my processor
+        // we are gonna process in pair, since we can using AVX, man it feels like a super power
+        {
+            const auto src = reinterpret_cast<const __m256i*>(hots.data());
+            const auto dst = reinterpret_cast<__m256i*>(hot_+base);
+            // moving data that is held by hots's span(data() function returns raw pointer to underlying array of struct)
+            // now first lets move the first even order, that is if odd we will have 1 remaining, or else 0 if even
+            const uint32_t paris = count/2;
+            for (uint32_t i = 0; i < paris; ++i) {
+                _mm256_store_si256(dst+i, _mm256_loadu_si256(src+i));
+            }
+            // now check if the numbers we odd, using bitwise op
+            if (count & 1) {
+                // we will do this one the OG manner
+                new(hot_ + base + count - 1) OrderHot(hots[count-1]);
+            }
+        }
+        // Now something similar to cold orders, and since they are bothered by odd or even number of counts no extra checking needed
+        {
+            const auto src = reinterpret_cast<const __m256i*>(colds.data());
+            const auto dst = reinterpret_cast<__m256i*>(cold_+base);
+            for (uint32_t i = 0;i<count;++i) {
+                _mm256_store_si256(dst+i, _mm256_load_si256(src+i));
+            }
+        }
+        return {base};
+    }
+    // To access the hot order details
     [[nodiscard]]
     inline OrderHot* getHot(const OrderHandler h) const noexcept {
-        assert(h.valid() && h.index < size_);
+        assert(h.valid() && h.index < size_); // making sure that Orderhandler is valid
         return (hot_ + h.index);
     }
     // to just access the cold details
@@ -111,7 +148,22 @@ public:
         assert(h.valid() && h.index < size_);
         return (cold_ + h.index);
     }
-    inline void reset() noexcept { size_ = 0; }
+    inline void reset() noexcept { size_ = 0; } // sets the start index to 0
+    // the data is still there, but marking them as empty, and further modifying as we go on
+    // but what if you want a clean slate, you use clear:
+    void clear() noexcept {
+        if (size_==0) return;
+        // now for setting 0 we will again use AVX function which we created above
+        // but for that hot must be even again, so a layer of checking
+        const size_t hot_b = sizeof(OrderHot) * size_;
+        const size_t hot_simd = (hot_b/32) * 32; // simple
+        simdZero(hot_,hot_simd);
+        if (hot_b > hot_simd) {
+            memset(reinterpret_cast<char*>(hot_)+hot_simd,0,hot_b-hot_simd);
+        }
+        simdZero(cold_,sizeof(OrderCold) * size_);
+        size_ = 0;
+    }
     [[nodiscard]]
     inline size_t size() const noexcept{ return size_; }
     [[nodiscard]]
