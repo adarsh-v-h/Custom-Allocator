@@ -79,31 +79,27 @@ int main() {
         const auto t0 = std::chrono::high_resolution_clock::now();
         for (uint64_t i = 0; i < N; ++i) {
             ptrs.push_back(new Order{i, 1000ull, 102ull + i, 45u, 45u, 1u, 1u, 1u, {}});
-            checksum += ptrs.back()->order_id;
         }
-        for (Order* p : ptrs) delete p;
         const auto t1 = std::chrono::high_resolution_clock::now();
-        do_not_optimize(checksum);
-        std::cout << "new/delete: "
-                  << std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+        const auto alloc_time = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        do_not_optimize(alloc_time);
+        std::cout << "new/delete allocation: "
+                  << alloc_time
                   << "µs\n";
 
-        std::vector<Order*> ptrs2;
-        ptrs2.reserve(N);
-        for (uint64_t i = 0; i < N; ++i) {
-            ptrs2.push_back(new Order{i, 1000ull, 102ull + i, 45u, 45u, 1u, 1u, 1u, {}});
-        }
         const auto t2 = std::chrono::high_resolution_clock::now();
         checksum = 0;
         for (uint64_t i = 0; i < N; ++i) {
             checksum += ptrs[i]->order_id;
         }
         const auto t3 = std::chrono::high_resolution_clock::now();
+        const auto cold_access_time = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
         do_not_optimize(checksum);
-        std::cout << "Order access time: "
-                  << std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count()
+        std::cout << "Standard pointer cold scan: "
+                  << cold_access_time
                   << "µs\n";
-        for (Order* p : ptrs2) delete p;
+
+        for (Order* p : ptrs) delete p;
     }
 
     return 0;

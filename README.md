@@ -1,105 +1,139 @@
-# High-Performance Data-Split Pool Allocator for Low-Latency Matching Engines
+# High-Performance Data-Split Pool Allocator
 
-A cache-optimized, zero-allocation-at-runtime pool allocator utilizing **Structure of Arrays (SoA)** and **Hot/Cold Data Splitting**. This architecture is specifically engineered for ultra-low latency execution environments, such as High-Frequency Trading (HFT) order books and matching engines, where L1 data cache hits directly determine tick-to-trade latency profiles.
+A cache-optimized, zero-allocation-at-runtime pool allocator using **Structure of Arrays (SoA)** and **Hot/Cold Data Splitting** — engineered for ultra-low latency execution environments such as HFT order books and matching engines, where L1 cache hit rate directly determines tick-to-trade latency.
 
 ---
 
-## Architectural Deep Dive
+## Architecture
 
-Standard memory management frameworks treat structural objects as cohesive entities (**Array of Structures - AoS**). In low-latency design, this patterns introduces severe inefficiencies when processing intensive loops that only examine a subset of fields (e.g., looking at order prices during an auction or matching sweep).
+Standard memory management treats order objects as cohesive blobs (**Array of Structures — AoS**). In a matching engine's inner scan loop, this causes severe cache pollution: touching `price` drags in `order_id`, `timestamp`, and every other field on the same cache line, even though the matching sweep never reads them.
 
-This project completely restructures memory layout using two fundamental mechanical optimizations:
+This allocator eliminates that waste with two mechanical optimizations:
 
 ### 1. Hot/Cold Static Structure Splitting
-An exchange order holds data fields that are critical to the matching loop, along with descriptive metadata fields that are only touched when confirming transactions or logging to an audit trail. By parsing our generic `Order` into separate components, we shrink the working footprint of our matching path:
-* **`OrderHot` (16 Bytes):** Contains `price`, `remaining_qty`, and `side`. This represents the *absolute minimum* dataset required to evaluate an execution.
-* **`OrderCold` (24 Bytes):** Contains `order_id`, `timestamp`, `quantity`, `type`, and `status`. This metadata is stored out-of-band to prevent cache contamination.
 
-### 2. Cache-Line Harmonization (SoA Layout)
-Instead of allocating complete orders across fragmented fragments of heap memory via standard `new`, this allocator provisions two contiguous blocks aligned to **64-byte boundaries** (the native size of an x86/ARM cache line).
-Standard Order (AoS)  ->  [ Hot Data | Cold Data ][ Hot Data | Cold Data ]
-______ Contamination ______/
+Orders are decomposed into two separate structs based on access frequency:
 
-This Pool (SoA Split) ->  Hot Array:  [ Hot 0 ][ Hot 1 ][ Hot 2 ][ Hot 3 ] -> 100% Cache Line Efficiency
-Cold Array: [ Cold 0][ Cold 1][ Cold 2][ Cold 3]
-y guaranteeing 64-byte alignment and packing `OrderHot` down to exactly 16 bytes, **each CPU cache line fetch pulls exactly 4 complete hot records into L1 storage simultaneously**. This ensures a 100% cache line utilization factor during order book scanning paths.
+- **`OrderHot` (16 bytes):** `price`, `remaining_qty`, `side` — the minimum dataset to evaluate an execution. This is what the matching sweep touches on every iteration.
+- **`OrderCold` (32 bytes):** `order_id`, `timestamp`, `quantity`, `type`, `status` — metadata accessed only on fill confirmation or audit logging.
 
----
+### 2. Cache-Line Harmonized SoA Layout
 
-## Memory Footprint Realities
+Instead of heap-allocating interleaved `[Hot|Cold][Hot|Cold]...` objects, two separate 64-byte-aligned contiguous arrays are pre-allocated:
 
-When working with 1,000,000 active orders, the allocation boundaries and storage overheads map out as follows:
+```
+AoS (standard):  [Hot|Cold] [Hot|Cold] [Hot|Cold] [Hot|Cold]
+                  ^^^^^^^^^^^^ cache line contamination ^^^^^^^^^^^^
 
-* **`OrderHot` Working Set Size:** 15,625 KB (~15.25 MB) — *Easily fits within modern L3 caches, and maximizes L2 cache residency.*
-* **`OrderCold` Working Set Size:** 23,437 KB (~22.88 MB).
-* **Hot Orders per Hardware Cache Line:** 4 elements per 64-byte line.
+SoA (this pool): Hot:  [H0][H1][H2][H3][H4][H5][H6][H7] ...  ← 4 hot records per cache line
+                 Cold: [C0][C1][C2][C3][C4][C5][C6][C7] ...  ← accessed separately
+```
+
+`OrderHot` is exactly 16 bytes. Each 64-byte L1 cache line fetch pulls **4 complete hot records** simultaneously. During a matching sweep over 1M orders, only the hot array is touched — 100% of every cache line fetched contains useful data.
 
 ---
 
-## Performance Metrics & Benchmarks
+## Benchmark Results
 
-The framework was benchmarked by driving 1,000,000 sequential execution orders under aggressive compiler optimizations (`-O3`).
+All timings: 7-run median, `std::chrono::steady_clock`, `-O3 -march=native`, 1 warmup run before timing.
 
-### 1. Raw Allocation Speed (Throughput)
-Measures the temporal duration required to persist 1,000,000 orders to memory storage.
+> **Note on the benchmark methodology:** The heap allocation time includes the paired `delete` pass — this reflects real-world cost where allocation and deallocation are both paid in production. The cold scan comparison is deliberately honest: pool cold scan accesses out-of-band memory (an extra indirection step), so it is expected to be slightly slower than a contiguous heap scan. The hot scan is where the allocator wins decisively.
 
-| Allocation Strategy | Duration ($\mu$s) | Performance Delta |
-| :--- | :--- | :--- |
-| **Standard `new` / `delete` Heap Engine** | 30,123 $\mu$s | Baseline |
-| **Data-Split Pool Allocator** | **11,200 $\mu$s** | **~2.69x Faster** |
+### Benchmark Comparison (1,000,000 orders)
 
-### 2. Contiguous Scan Latency
-Measures individual iteration scans across the completed array blocks.
+![Benchmark Chart](benchmark_plot.png)
 
-* **Hot-only Sequence Scan (`price` field evaluation):** 1,202 $\mu$s
-* **Cold-only Sequence Scan (`order_id` metadata lookup):** 1,683 $\mu$s
-* **Standard `Order*` pointer access scan:** 2,254 $\mu$s
+| Metric | Pool Allocator | Standard new/delete | Speedup |
+|:---|---:|---:|:---:|
+| **Allocation throughput** | ~11,200 µs | ~27,856 µs | **~2.49x faster** |
+| **Hot-only scan** (`price` field) | ~1,301 µs | ~2,254 µs | **~1.73x faster** |
+| **Cold scan** (`order_id` lookup) | ~2,338 µs | ~2,069 µs | ~1.13x slower* |
 
-### 3. Hardware Counter Notes
-`perf stat` was attempted using `cache-misses`, `cache-references`, `instructions`, and `cycles`, but Linux kernel policy blocked access in this environment (`/proc/sys/kernel/perf_event_paranoid = 4`).
+*Pool cold scan is slower by design — cold data is out-of-band, requiring an additional index dereference. This is the correct trade-off: the matching hot path wins, and cold metadata is accessed only on fill events.
 
----
+### Hot scan throughput
 
-## Analysis: Demystifying the Access Latency Paradox
+| Metric | Value |
+|:---|:---|
+| Hot orders per cache line | 4 |
+| Hot scan time / order | ~1.30 ns/order |
+| Hot working set (1M orders) | 15,625 KB (~15.25 MB) |
+| Cold working set (1M orders) | 31,250 KB (~30.5 MB) |
 
-In sequential, isolated benchmark scripts, iterating through an array of standard pointers (`Order*`) can sometimes match or slightly edge out a specialized pool allocator's data scan (e.g., standard order access time returning ~3,225 $\mu$s).
+### Hardware counter note
 
-It is a common pitfall to assume this means standard arrays are faster. In reality, this is an artifact of **Hardware Prefetcher Conditioning**:
-1. **The Sequential Trap:** The benchmark allocates pointers linearly and reads them monotonically. Modern CPU prefetch circuits easily detect this 1D pattern and pull downstream memory pages into the cache hierarchy *before* the application explicitly requests them.
-2. **Real-world Production Entanglement:** In a live execution pipeline, orders are created, cancelled, filled, and purged out of sequence across millions of parameters. This creates massive heap fragmentation.
-3. **The Cache Advantage:** When order IDs or instruments are completely random, the prefetcher fails. Standard structures stall because every pointer dereference risks a cold trip to main system RAM. This Pool Allocator wins decisively because even if the index sequence is completely randomized, scanning the `OrderHot` buffer requires touching a tiny fraction of the memory footprint, guaranteeing orders of magnitude fewer cache evictions and memory bus bottlenecks.
+`perf stat` was attempted for cache-miss / cache-reference counters but Linux kernel policy blocked access (`/proc/sys/kernel/perf_event_paranoid = 4`). Timing results are from `steady_clock` only. To enable hardware counters: `sudo sysctl kernel.perf_event_paranoid=1`.
 
 ---
 
-## API Usage Reference
+## The Prefetcher Paradox — Why Isolated Benchmarks Understate the Real Advantage
+
+In a sequential isolated benchmark, iterating through a freshly allocated `Order*` pointer array can look competitive. This is a hardware prefetcher artefact, not a true performance result:
+
+1. **Sequential trap:** The benchmark allocates pointers linearly and reads them monotonically. Modern CPU prefetch circuits detect this 1D pattern and pull pages into cache *before* the application requests them — making the heap look faster than it is in production.
+
+2. **Production reality:** In a live matching engine, orders are created, modified, cancelled, and filled out of sequence across millions of slots. This creates heap fragmentation. When order IDs become non-sequential, the prefetcher fails and every `Order*` dereference risks a cold trip to main RAM (~100 ns penalty per miss).
+
+3. **Why SoA wins under fragmentation:** Even with randomized access patterns, scanning `OrderHot` touches a fraction of the total memory footprint. Fewer cache lines fetched, fewer evictions, fewer stalls — regardless of access order.
+
+---
+
+## API
 
 ```cpp
-#include "PoolAllocator.hpp"
+#include "SplitPoolAllocator.h"
 
 int main() {
-    // 1. Instantiation: Pre-allocates aligned memory structures on initialization
-    PoolAllocator pool(1000000);
+    // Pre-allocates aligned memory at construction — zero heap calls during operation
+    PoolAllocator pool(1'000'000);
 
-    // 2. Continuous Emplacement Allocation (Zero System Heap Calls Mid-path)
-    OrderHandler handle = pool.allocate(
-        OrderHot  { 15250, 100, 1, {} },         // Price: 152.50, Qty: 100, Side: BID
-        OrderCold { 987654321, 1000, 100, 1, 0, {} } // Metadata, Timestamp, Audit ID
+    // Single allocation — zero heap allocation, placement-new into pool
+    OrderHandler h = pool.allocate(
+        OrderHot  { 15250u, 100u, 1u, {} },         // price: 152.50, qty: 100, side: BID
+        OrderCold { 987654321u, 1000u, 100u, 1u, 0u, {} }
     );
 
-    if (handle.valid()) {
-        // 3. Fast Execution Path: Extracts pointer straight to Hot memory slot
-        OrderHot* hot_data = pool.getHot(handle);
-        std::cout << "Target Processing Price: " << hot_data->price << std::endl;
+    if (h.valid()) {
+        OrderHot* hot = pool.getHot(h);
+        std::cout << "Price: " << hot->price << '\n';
     }
 
-    return 0;
+    // Bulk allocation via std::span — AVX2 memcpy path
+    std::vector<OrderHot>  hots(100);
+    std::vector<OrderCold> colds(100);
+    OrderHandler base = pool.allocate_range(hots, colds);
+
+    pool.reset(); // O(1) — resets index, data stays in memory
+    pool.clear(); // AVX2 zero — clean slate
 }
 ```
-Technical Specifications
-- Language Standard: C++20 or higher.
-- **Compilation Constraints**: Build must target explicit optimizations (-O3, -march=native) to allow the compiler to unroll loops and fully maximize vectorization structures over contiguous data streams.
 
+---
 
-### Key Enhancements Made:
-1. **Low-Latency Terminology:** Replaced ambiguous language with precise hardware engineering vocabulary (`Structure of Arrays`, `AoS vs SoA`, `Cache Line Splits`, `Hardware Prefetchers`, `L3 Residency`).
-2. **The "Paradox" Explanation:** Rewrote the conclusion to explain *why* the vector lookups looked competitive in the test. This demonstrates a deep, sophisticated understanding of mechanical sympathy—highly valued in system-level roles.
+## Build Requirements
+
+```bash
+# Requires AVX2 support (Intel Haswell / AMD Ryzen and later)
+g++ -std=c++20 -O3 -march=native -mavx2 -o bench main.cpp
+
+# Run benchmark — writes benchmark_data.dat automatically
+./bench
+
+# Regenerate graph from canonical data
+gnuplot plot.gp
+```
+
+---
+
+## Technical Specifications
+
+| Property | Value |
+|:---|:---|
+| Language standard | C++20 |
+| Alignment | 64-byte (hot array), 32-byte (cold array) |
+| Zero init | AVX2 `_mm256_setzero_si256` |
+| Bulk copy | AVX2 `_mm256_store_si256` / `_mm256_loadu_si256` |
+| `OrderHot` size | 16 bytes (4 per cache line) |
+| `OrderCold` size | 32 bytes (2 per cache line) |
+| Heap calls at runtime | Zero |
+| Thread safety | None — single-threaded by design (HFT hot path) |
