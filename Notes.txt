@@ -1,0 +1,57 @@
+What are custom allocators ??
+- A memory managing and allocation system created by a developer for a very particular use case
+- A service that grants exclusive use of region of memory to client
+
+What is an allocator for STL ??
+- A kind of object used by the Cpp SL to manage memory
+- Attempt to solve near/far/huge pointer types of PCs at the time
+
+What should an Allocator do??
+- Perform allocation/constrcution/destruction/dealloction
+- Also making sure allocation is not same as construction of an object in that allocated loc, same with destruction and deallocation
+
+If an STL Allocator already exists, why your own allocator??
+- Higher performance: stack-based allocation, per-conatiner private allocation, pre-thread allocation, pooled/slab allocation, Arena allocation
+- Debug/ instrumented/test
+-  Relocatable Data: shared memory, self-contained heaps
+
+Note: allocation needs help of kernel, but construction happens via OS on user level itself, same with deallocation and destructions.
+
+How are allocators used by STL??
+- We actually pass an allocator as one of template parameter.
+- Now these allocators themself are some class, with soem Datatypes and functions
+- They overide != and == for particular usecases
+- One intereseting thing is rebind: When you send an allocator<int> to a set(assume), saying that you want to use allocator of type int to allocate,
+but the struct the set uses underneath is of a type RED-BLACK Tree, now what?? this is where rebind comes in: for given allocator<int>, but internally needs
+allocator<RB_tree>, so you convert int to RB_Tree. Same with lists, you dont allocate an int, you allocate a node that holds the int(but also pointer/s).
+
+Issues with STL allocator:
+- No support for synthetic pointers/ alternate addressing models
+- Standard containers did not support stateful allocators
+- Some problems like shared memory data structures or self-contained heaps, couldn't be solved
+- Scoped allocation was tricky.
+
+Note: What is stateful and stateless?
+- State is simply data or context that describes the current condition of a system at specific point in time.
+
+- A stateless system treats every single request or operation as a completely isolated event.
+It has zero memory of what happened a second ago, and it does not retain any contextual history.
+How it works: To get a successful response, the client must provide all the necessary information inside the request itself every single time.
+IN REAL WORLD EXAMPLE:
+HTTP Protocol: The foundation of the web is stateless.
+When you click a link on a website, the web server processes that request without naturally remembering that you just clicked a different link a second ago.
+Math Functions (sin(x), sqrt(x)): In programming, a pure function is stateless.
+If you call sqrt(16), it always returns 4. It doesn't depend on or alter any global variables outside of itself.
+REST APIs: Standard REST architectures require requests to be stateless so that any server instance behind a load balancer can handle any incoming request.
+
+- A stateful system actively keeps track of history, configurations, user preferences, and previous interactions.
+The outcome of a current operation depends heavily on what happened before.
+How it works: The system maintains a "state" (usually in memory, a database, or storage).
+When a request comes in, the system checks its internal memory, processes the request based on that memory, and then updates its memory for the next time.
+IN REAL WORLD EXAMPLE:
+Online Shopping Carts: When you add an item to a cart on Amazon and click to the next page, the item is still there.
+The website is maintaining a stateful session for you.
+TCP Protocol: Unlike HTTP, the lower-level TCP network protocol is stateful. It requires a "three-way handshake" to establish a connection,
+tracks packet sequences, and actively maintains the connection state until it is explicitly closed.
+Database Transactions: When you log into a database and type BEGIN TRANSACTION,
+the database enters a stateful mode where it tracks your subsequent queries until you type COMMIT or ROLLBACK.
